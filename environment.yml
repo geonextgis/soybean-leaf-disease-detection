@@ -1,0 +1,14 @@
+name: soybean-leaf-disease-detection
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - typer
+  - loguru
+  - tqdm
+  - ruff
+  - pip:
+    - python-dotenv
+    - mkdocs
+    - -e .
