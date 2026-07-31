@@ -1,6 +1,7 @@
 import math
 from typing import List, Tuple
 
+from einops import rearrange
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -10,8 +11,8 @@ from ..utils.utils import cat_keep_shapes, uncat_with_shapes
 
 # RoPE-related functions:
 def rope_rotate_half(x: Tensor) -> Tensor:
-    # x: [x0  x1  x2  x3  x4  x5]
-    # out: [-x5  -x4  -x3  x0  x1  x2]
+    # x:   [ x0   x1   x2  x3  x4  x5]
+    # out: [-x3  -x4  -x5  x0  x1  x2]
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([-x2, x1], dim=-1)
 
@@ -34,37 +35,130 @@ class LinearKMaskedBias(nn.Linear):
     def forward(self, input: Tensor) -> Tensor:
         masked_bias = self.bias * self.bias_mask.to(self.bias.dtype) if self.bias is not None else None
         return F.linear(input, self.weight, masked_bias)
-    
+ 
 
-# def SelfAttention(nn.Module):
-#     def __init__(
-#         self,
-#         dim: int,
-#         num_heads: int = 8,
-#         qkv_bias: bool = False,
-#         proj_bias: bool = True,
-#         attn_drop: float = 0.0,
-#         proj_drop: float = 0.0,
-#         mask_k_bias: bool = False,
-#         device = None,
-#     ) -> None:
-#         super().__init__()
-#         self.num_heads = num_heads
-#         head_dim = dim // num_heads
-#         self.scale = head_dim**-0.5
+class SelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        mask_k_bias: bool = False,
+        device = None,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
         
-#         linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
-#         self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
-#         self.attn_drop = nn.Dropout(attn_drop)
-#         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
-#         self.proj_drop = nn.Dropout(proj_drop)
+        linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
+        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
+        self.proj_drop = nn.Dropout(proj_drop)
         
-#     def apply_rope(self, q: Tenosr, k: Tensor, rope: Tensor):
-#         q_dtype = q.dtype
-#         k_dtype = k.dtype
-#         sin, cos = rope
-#         rope_dtype = sin.dtype
-#         q = q.to(dtype=rope_dtype)
-#         k = k.to(dtype=rope_dtype)
-#         N = q.shape[-2]
+    def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
+        q_dtype = q.dtype
+        k_dtype = k.dtype
+        sin, cos = rope
+        rope_dtype = sin.dtype
+        q = q.to(dtype=rope_dtype)
+        k = k.to(dtype=rope_dtype)
+        N = q.shape[-2]
+        prefix = N - sin.shape[-2]
+        assert prefix >= 0
+        q_prefix = q[:, :, :prefix, :]
+        q = rope_apply(q[:, :, prefix:, :], sin, cos) # [B. head, hw, D//head]
+        q = torch.cat((q_prefix, q), dim=-2) # [B, head, N, D//head]
+        k_prefix = k[:, :, :prefix, :]
+        k = rope_apply(k[:, :, prefix:, :], sin, cos) # [B. head, hw, D//head]
+        k = torch.cat((k_prefix, k), dim=-2) # [B, head, N, D//head]
+        q = q.to(dtype=q_dtype)
+        k = k.to(dtype=k_dtype)
+        return q, k
         
+    def forward(self, x: Tensor, attn_bias=None, rope: Tensor = None) -> Tensor:
+        qkv = self.qkv(x)
+        attn_v = self.compute_attention(qkv, attn_bias=attn_bias, rope=rope)
+        x = self.proj(attn_v)
+        x = self.proj_drop(x)
+        return x
+    
+    def forward_list(self, x_list, attn_bias=None, rope_list=None) -> List[Tensor]:
+        assert len(x_list) == len(rope_list)
+        x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
+        qkv_flat = self.qkv(x_flat)
+        qkv_list = uncat_with_shapes(qkv_flat, shapes, num_tokens)
+        attn_out = []
+        for _, (qkv, _, rope) in enumerate(zip(qkv_list, shapes, rope_list)):
+            attn_out.append(self.compute_attention(qkv, attn_bias=attn_bias, rope=rope))
+        x_flat, shapes, num_tokens = cat_keep_shapes(attn_out)
+        x_flat = self.proj(x_flat)
+        return uncat_with_shapes(x_flat, shapes, num_tokens)
+    
+    def compute_attention(self, qkv: Tensor, attn_bias: None, rope=None) -> Tensor:
+        assert attn_bias is None
+        B, N, _ = qkv.shape
+        C = self.qkv.in_features
+        
+        qkv = rearrange(qkv, "b n (three h d) -> b n three h d", three=3, h=self.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [rearrange(t, "b n h d -> b h n d") for t in [q, k, v]]
+        if rope is not None:
+            q, k = self.apply_rope(q, k, rope)
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = rearrange(x, "b h n d -> b n h d")
+        x = rearrange(x, "b n h d -> b n (h d)") 
+        return x
+    
+    
+class CausalSelfAttention(nn.Module):
+    def __init__(
+        self, 
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+        
+        self.qkv = nn.Linear(dim, dim*3, bias=qkv_bias)
+        self.attn_drop = attn_drop
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+    def init_weights(
+        self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
+    ) -> None:
+        init_attn_std = init_attn_std or (self.dim**-0.5)
+        init_proj_std = init_proj_std or init_proj_std * factor
+        nn.init.normal_(self.qkv.weight, std=init_attn_std)
+        nn.init_normal_(self.proj.weight, std=init_proj_std)
+        if self.qkv.bias is not None:
+            nn.init.zeros_(self.qkv.bias)
+        if self.proj_bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        
+    def forward(self, x: Tensor, is_causal: bool = True) -> Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x)
+        qkv = rearrange(qkv, "b n (three h d) -> b n three h d", three=3, h=self.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [rearrange(t, "b n h d -> b h n d") for t in [q, k, v]]
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
+        )
+        x = rearrange(x, "b h n d -> b n h d")
+        x = rearrange(x, "b n h d -> b n (h d)")
+        x = self.proj_drop(self.proj(x))
+        return x
