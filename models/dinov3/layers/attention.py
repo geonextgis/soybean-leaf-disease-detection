@@ -141,12 +141,12 @@ class CausalSelfAttention(nn.Module):
         self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
     ) -> None:
         init_attn_std = init_attn_std or (self.dim**-0.5)
-        init_proj_std = init_proj_std or init_proj_std * factor
+        init_proj_std = init_proj_std or init_attn_std * factor
         nn.init.normal_(self.qkv.weight, std=init_attn_std)
-        nn.init_normal_(self.proj.weight, std=init_proj_std)
+        nn.init.normal_(self.proj.weight, std=init_proj_std)
         if self.qkv.bias is not None:
             nn.init.zeros_(self.qkv.bias)
-        if self.proj_bias is not None:
+        if self.proj.bias is not None:
             nn.init.zeros_(self.proj.bias)
         
     def forward(self, x: Tensor, is_causal: bool = True) -> Tensor:
