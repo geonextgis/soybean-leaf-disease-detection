@@ -1,12 +1,11 @@
 import math
 from typing import List, Tuple
 
+from dinov3.utils import cat_keep_shapes, uncat_with_shapes
 from einops import rearrange
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-
-from ..utils.utils import cat_keep_shapes, uncat_with_shapes
 
 
 # RoPE-related functions:
