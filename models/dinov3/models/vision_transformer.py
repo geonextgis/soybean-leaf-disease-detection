@@ -14,8 +14,7 @@ from dinov3.layers import (
     RopePositionEmbedding,
     SelfAttentionBlock,
 )
-
-# from dinov3.utils import 
+from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
 
@@ -174,13 +173,13 @@ class DinoVisionTransformer(nn.Module):
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
             
-    # def init_weights(self):
-    #     self.rope_embed._init_weights()
-    #     nn.init.normal_(self.cls_token, std=0.02)
-    #     if self.n_storage_tokens > 0:
-    #         nn.init.normal_(self.storage_tokens, std=0.02)
-    #     nn.init.zeros_(self.mask_token)
-    #     named_apply(init_weights_vit, self)
+    def init_weights(self):
+        self.rope_embed._init_weights()
+        nn.init.normal_(self.cls_token, std=0.02)
+        if self.n_storage_tokens > 0:
+            nn.init.normal_(self.storage_tokens, std=0.02)
+        nn.init.zeros_(self.mask_token)
+        named_apply(init_weights_vit, self)
     
     def prepare_token_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int]]:
         x = self.patch_embed(x)
@@ -263,4 +262,80 @@ class DinoVisionTransformer(nn.Module):
         else:
             return self.forward_features_list(x, masks)
         
+    def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1) -> List[Tensor]:
+        x, (H, W) = self.prepare_token_with_masks(x)
+        # If n is an int, take the n last blocks. If it's a list, take them
+        output, total_block_len = [], len(self.blocks)
+        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        for i, blk in enumerate(self.blocks):
+            if self.rope_embed is not None:
+                rope_sincos = self.rope_embed(H=H, W=W)
+            else:
+                rope_sincos = None
+            x = blk(x, rope_sincos)
+            if i in blocks_to_take:
+                output.append(x)
+        assert len(output) == len(blocks_to_take), f"only {len(output) / {len(blocks_to_take)}} blocks found"
+        return output
+    
+    def get_intermediate_layer(
+        self,
+        x: torch.Tensor,
+        *,
+        n: Union[int, Sequence] = 1, # Layers or n last layers to take
+        reshape: bool = False,
+        return_class_token: bool = False,
+        return_extra_tokens: bool = False,
+        norm: bool = True,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+        outputs = self._get_intermediate_layers_not_chunked(x, n)
+        if norm:
+            outputs_normed = []
+            for out in outputs:
+                if self.untie_cls_and_patch_norms:
+                    x_norm_cls_reg = self.cls_norm(out[:, : self.n_storage_tokens + 1])
+                    x_norm_patch = self.norm(out[:, self.n_storage_tokens + 1 :])
+                    outputs_normed.append(torch.cat((x_norm_cls_reg, x_norm_patch), dim=1))
+                else:
+                    outputs_normed.append(self.norm(out))
+            outputs = outputs_normed
+        class_tokens = [out[:, 0] for out in outputs]
+        extra_tokens = [out[:, 1 : self.n_storage_tokens + 1] for out in outputs]
+        outputs = [out[:, self.n_storage_tokens + 1 :] for out in outputs]
+        if reshape:
+            B, _, h, w = x.shape
+            outputs = [
+                out.reshape(B, h // self.patch_size, w // self.patch_size, -1).permute(0, 3, 1, 2).contiguous()
+                for out in outputs
+            ]
+        if not return_class_token and not return_extra_tokens:
+            return tuple(outputs)
+        elif return_class_token and not return_extra_tokens:
+            return tuple(zip(outputs, class_tokens))
+        elif not return_class_token and return_extra_tokens:
+            return tuple(zip(outputs, extra_tokens))
+        elif return_class_token and return_extra_tokens:
+            return tuple(zip(outputs, class_tokens, extra_tokens))
+        
+    def forward(self, *args, is_training: bool = False, **kwargs) -> List[Dict[str, Tensor]] | Tensor:
+        ret = self.forward_features(*args, **kwargs)
+        if is_training:
+            return ret
+        else:
+            return self.head(ret["x_norm_clstoken"])
+        
+
+def vit_small(patch_size=16, **kwargs):
+    model = DinoVisionTransformer(
+        patch_size=patch_size,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        ffn_ratio=4,
+        **kwargs,
+    )
+    return model
+                
+        
+   
         
