@@ -1,4 +1,1 @@
-from .utils import (
-    cat_keep_shapes,
-    uncat_with_shapes,
-)
+from .utils import cat_keep_shapes, named_apply, uncat_with_shapes
